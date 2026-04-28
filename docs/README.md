@@ -45,7 +45,8 @@ This means Dropbox credentials are not required on user desktops.
 
 1. Create the master database by running [`database/01_Create_MasterDb.sql`](../database/01_Create_MasterDb.sql).
 2. Seed baseline roles and bootstrap settings by running [`database/02_Seed_MasterDb.sql`](../database/02_Seed_MasterDb.sql).
-3. The seed does not create an admin user. Create the first administrator through the bootstrap API flow described below.
+3. Existing deployments can add backup-upload settings by running [`database/05_Add_BackupUpload_Settings.sql`](../database/05_Add_BackupUpload_Settings.sql).
+4. The seed does not create an admin user. Create the first administrator through the bootstrap API flow described below.
 
 Helpful recovery scripts:
 
@@ -53,6 +54,8 @@ Helpful recovery scripts:
   - identifies suspicious or invalid password hashes in `core.Users`
 - [`database/04_Reset_Invalid_Bootstrap_Admin.sql`](../database/04_Reset_Invalid_Bootstrap_Admin.sql)
   - safely removes only the invalid bootstrap admin row and resets bootstrap flags
+- [`database/05_Add_BackupUpload_Settings.sql`](../database/05_Add_BackupUpload_Settings.sql)
+  - adds the central settings used by the backup and Dropbox upload workflow
 
 ## Database tables reference
 
@@ -296,7 +299,13 @@ Recommended behavior:
 - strongly typed controls instead of raw JSON
 - path validation before save
 - range validation for numeric fields
-- duplicate local SQL field groups should clearly indicate whether the user is editing API-side defaults or desktop-side local behavior
+
+Backup upload settings:
+
+- `BackupUpload:DropboxFolder`: Dropbox folder where locally-created SQL Server backups are uploaded.
+- `BackupUpload:FilePrefix`: filename prefix used for generated upload backups.
+- `BackupUpload:LocalRetentionCount`: number of local upload-backup `.bak` files retained in the working directory.
+- API-side Local SQL keys should stay out of the normal admin settings screen because they do not control desktop restore targets or backup sources.
 
 ### 2. Desktop Environment Settings
 
@@ -442,6 +451,7 @@ Phase 2:
   - logging levels
   - `AllowedHosts`
   - API-side Dropbox staging directories
+- keep API-side Local SQL fields hidden unless a real server-side SQL workflow starts using them
 
 Phase 3:
 
@@ -462,6 +472,7 @@ Phase 3:
 2. In the Dropbox App Console, enable at least:
    - `files.metadata.read`
    - `files.content.read`
+   - `files.content.write`
 3. Register the exact redirect URI used by the API, for example:
    - `https://localhost:7280/api/settings/dropbox/oauth/callback`
    - or your deployed IIS/API URL equivalent
@@ -576,6 +587,135 @@ During sync the desktop also:
 - writes a per-run sync log file under `%LocalAppData%\DropboxSqlSyncSuite\SyncLogs`
 - keeps the sync screen open after success or failure until the user returns manually
 - records console/audit details so newer report entries can open the full console log later
+
+### Normal sync vs forced resync
+
+Normal sync means the user clicks `Sync Latest Backup` and the app performs the regular restore path: status check, newest Dropbox `.bak` selection, download through the API, safety backup, local SQL restore, console log, and sync-history audit.
+
+Forced resync means an admin has marked that user for a required refresh. It does not run automatically in the background. The next time that user clicks sync, the desktop still follows the same restore path, but the run is treated as admin-required and is audited with `TriggeredBy = ForcedResync`. When that forced run succeeds, the pending forced-resync request is cleared.
+
+Real scenarios for Forced Resync:
+
+- an admin uploaded or selected a corrected master `.bak` and wants a specific user to refresh from it
+- a user's local SQL database is suspected to be stale, corrupt, or out of step with the master source
+- the admin needs a clear audit trail showing that the user's next sync was required by administration
+
+## Database target and source settings
+
+Use this section when an admin needs to control either side of the database movement:
+
+- restore direction: Dropbox `.bak` -> desired local SQL database
+- backup direction: specific local SQL database -> new `.bak` uploaded to Dropbox
+
+### Restore a Dropbox `.bak` to a desired database name
+
+Restore sync chooses the destination database in this priority order:
+
+1. `Admin User Management -> Assigned destination database`
+   - User-specific restore target.
+2. `Settings -> Central application settings -> Default local database name (fallback)`
+   - Shared restore fallback when the user has no assigned destination database.
+3. `Settings -> Desktop environment settings -> Local SQL database name`
+   - Final technical fallback only.
+
+Restore also uses these desktop settings:
+
+- `Local SQL server name [Backup/Restore]`
+- `Local SQL logical data file name [Restore]`
+- `Local SQL MDF file path [Restore/cleanup]`
+- `Local SQL LDF file path [Restore/cleanup]`
+- `Local SQL working directory [Backup/Restore]`
+- `Create local safety backup before restore [Restore]`
+
+Scenario: one user restores to `SalesLocalDb`:
+
+```text
+Admin User Management -> Assigned destination database: SalesLocalDb
+Settings -> Desktop environment settings -> Local SQL server name: .\SQLEXPRESS
+Settings -> Desktop environment settings -> Local SQL logical data file name: SalesLocalDb
+Settings -> Desktop environment settings -> Local SQL MDF file path: C:\ProgramData\DropboxSqlSyncSuite\Data\SalesLocalDb.mdf
+Settings -> Desktop environment settings -> Local SQL LDF file path: C:\ProgramData\DropboxSqlSyncSuite\Data\SalesLocalDb_log.ldf
+```
+
+Scenario: all users without an assigned DB restore to `CompanyDefaultDb`:
+
+```text
+Settings -> Central application settings -> Default local database name (fallback): CompanyDefaultDb
+Admin User Management -> Assigned destination database: blank
+Settings -> Desktop environment settings -> Local SQL server name: .\SQLEXPRESS
+Settings -> Desktop environment settings -> Local SQL MDF file path: C:\ProgramData\DropboxSqlSyncSuite\Data\CompanyDefaultDb.mdf
+Settings -> Desktop environment settings -> Local SQL LDF file path: C:\ProgramData\DropboxSqlSyncSuite\Data\CompanyDefaultDb_log.ldf
+```
+
+MDF/LDF note for restore: if the target database name changes, keep the MDF and LDF paths in the same folder and use matching file names unless you intentionally want SQL Server files in another location. When a user-specific or central fallback database name is used, the desktop uses the configured MDF/LDF folders and derives file names from the effective database name.
+
+### Take a backup of a specific database
+
+Backup and Upload chooses the source database from the current desktop only:
+
+- `Settings -> Desktop environment settings -> Local SQL database name [Backup source / restore last fallback]`
+- `Settings -> Desktop environment settings -> Local SQL server name [Backup/Restore]`
+- `Settings -> Desktop environment settings -> Local SQL working directory [Backup/Restore]`
+
+Backup upload naming and destination use central settings:
+
+- `Settings -> Central application settings -> Backup upload file prefix [Backup upload]`
+- `Settings -> Central application settings -> Backup upload Dropbox folder [Backup upload]`
+- `Settings -> Central application settings -> Backup upload local retention count [Backup upload]`
+
+Scenario: back up `SalesLocalDb` and upload it to `/sql-backups/sales`:
+
+```text
+Settings -> Desktop environment settings -> Local SQL server name: .\SQLEXPRESS
+Settings -> Desktop environment settings -> Local SQL database name: SalesLocalDb
+Settings -> Desktop environment settings -> Local SQL working directory: C:\ProgramData\DropboxSqlSyncSuite\Working
+Settings -> Central application settings -> Backup upload file prefix: SalesLocalDb
+Settings -> Central application settings -> Backup upload Dropbox folder: /sql-backups/sales
+```
+
+MDF/LDF note for backup: Backup and Upload backs up an existing SQL database by server name and database name, so MDF/LDF paths are not used to create the `.bak`. Still keep MDF/LDF settings aligned with the same database if this desktop will also restore, roll back, or run deleted-account cleanup.
+
+Scenario: same desktop backs up and restores `SalesLocalDb`:
+
+```text
+Admin User Management -> Assigned destination database: SalesLocalDb
+Settings -> Desktop environment settings -> Local SQL database name: SalesLocalDb
+Settings -> Desktop environment settings -> Local SQL logical data file name: SalesLocalDb
+Settings -> Desktop environment settings -> Local SQL MDF file path: C:\ProgramData\DropboxSqlSyncSuite\Data\SalesLocalDb.mdf
+Settings -> Desktop environment settings -> Local SQL LDF file path: C:\ProgramData\DropboxSqlSyncSuite\Data\SalesLocalDb_log.ldf
+Settings -> Central application settings -> Backup upload file prefix: SalesLocalDb
+```
+
+Restart the desktop app after saving Desktop environment settings.
+
+## How the backup and upload flow works
+
+The dashboard also includes `Backup and Upload`, which mirrors the restore sync experience for the outbound direction.
+
+1. The desktop checks `/api/sync/my-status` before any backup work starts.
+2. If the account is `Deleted` or `Disabled`, the workflow is blocked and an audit entry is recorded.
+3. If allowed, the desktop loads the central backup-upload settings from `/api/settings`.
+4. The desktop creates a compressed SQL Server `.bak` from the configured local database through SMO.
+5. The desktop posts that `.bak` to `/api/sync/upload-backup`.
+6. The API uploads the file to Dropbox with the centrally stored refresh token.
+7. The desktop records the same style of console log and sync-history audit entry. Backup-upload entries use `TriggeredBy = BackupUpload`.
+
+During backup upload the desktop also:
+
+- shows the same live operation console used by restore sync
+- writes a per-run log file under `%LocalAppData%\DropboxSqlSyncSuite\SyncLogs`
+- keeps the progress screen open after success or failure
+- records Dropbox path, revision, local backup path, file size, source database, and error details in `DetailsJson`
+
+### Changing which database is backed up
+
+Backup and Upload uses the desktop-side local SQL settings from the current machine.
+
+- Change `Settings -> Desktop environment settings -> Local SQL database name [Backup source / restore last fallback]` to back up a different database.
+- That field maps to `LocalSql:DatabaseName` in the desktop configuration saved under `%LocalAppData%\DropboxSqlSyncSuite\Config\appsettings.json`.
+- Change `Local SQL server name [Backup/Restore]` only if the database is on another SQL Server instance.
+- Update `Settings -> Central application settings -> Backup upload file prefix [Backup upload]` if the uploaded `.bak` filename should match the new database name.
+- Keep MDF/LDF and logical-file settings aligned with the local deployment because restore and cleanup use those values.
 
 ## Bootstrap admin setup
 
